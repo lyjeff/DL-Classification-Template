@@ -1,30 +1,38 @@
 import os
-from tqdm import tqdm
+
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from dataset import DogDataset
+from argument_generator import Argument_Generator
+from dataset import Eval_Dataset
 from models.model import Model
-from utils import argument_setting, threshold_function
+from utils import label_decode, threshold_function
 
 
-def eval(args):
+def eval(argument_generator):
 
-    submit_csv = pd.read_csv(args.submit_csv, header=0)
+    # get argument settings
+    args = argument_generator.test_argument_setting()
+
     outputs_list = []
+    confidences_list = []
 
     # dataset
-    full_set = DogDataset(args.test_path, submit_csv)
+    full_set = Eval_Dataset(args.test_path)
 
     # choose training device
-    device = torch.device(f'cuda:{args.cuda}' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(
+        f'cuda:{args.cuda}' if torch.cuda.is_available() else 'cpu')
 
     # load model
-    model = Model().model_builder(args.model)
+    model, _ = Model().model_builder(args.model, num_classes=2537)
     model = model.to(device)
-    model.load_state_dict(torch.load(os.path.join(args.output_path, 'model_weights.pth')))
+    model.load_state_dict(torch.load(os.path.join(
+        args.output_path, 'model_weights.pth'), map_location=device))
 
     # set dataloader
     dataloader = DataLoader(
@@ -44,22 +52,28 @@ def eval(args):
             # forward
             outputs = model(inputs)
             outputs = nn.functional.softmax(outputs, dim=1)
-            outputs = outputs[:, 1]
+            confidences, preds = torch.max(outputs.data, 1)
+
+            preds = preds.data.cpu().numpy().tolist()
 
             # get threshold values
             if args.threshold != None:
                 outputs = threshold_function(outputs, args.threshold, device)
 
-            outputs = outputs.data.cpu().numpy().tolist()
-            outputs_list = outputs_list + outputs
+            outputs_list = outputs_list + preds
+            confidences_list = confidences_list + confidences.data.cpu().numpy().tolist()
 
-    submit_csv['label'] = outputs_list
-    submit_csv.to_csv(os.path.join(args.output_path, 'answer.csv'), index=False)
+    # submit_csv['label'] = outputs_list
+    # submit_csv.to_csv(os.path.join(
+    #     args.output_path, 'answer.csv'), index=False)
+
+    print(f"\nSaving output files in {args.output_path}")
 
     print("\nFinished Evaluating\n")
 
+
 if __name__ == '__main__':
 
-    args = argument_setting()
+    argument_generator = Argument_Generator()
 
-    eval(args)
+    eval(argument_generator)

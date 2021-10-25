@@ -1,19 +1,20 @@
 import os
 import time
-from tqdm import tqdm
-import pandas as pd
 
+import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from torch.optim.lr_scheduler import ExponentialLR
-# from torchsummary import summary
-
+from argument_generator import Argument_Generator
 from matplotlib import pyplot as plt
+from torch.optim.lr_scheduler import ExponentialLR
+from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 
-from dataset import CatDataset
+from dataset import MyDataset
 from models.model import Model
-from utils import argument_setting, threshold_function, cross_validation
+from utils import cross_validation, threshold_function
+
+# from torchsummary import summary
 
 
 def train(args):
@@ -24,33 +25,34 @@ def train(args):
     state_name = f"{args.model}_{args.optim}_{args.epochs}_{args.lr}_{args.batch_size}_{run_time}"
 
     # dataset
-    full_set = CatDataset(args.train_path)
+    full_set = MyDataset(args.train_path)
+    num_classes = full_set.num_classes     # num_classes = 2537
 
     # use torch.random_split to create the validation dataset
-    lengths = [int(round(len(full_set) * args.holdout_p)), int(round(len(full_set) * (1 - args.holdout_p)))]
+    lengths = [int(round(len(full_set) * args.holdout_p)),
+               int(round(len(full_set) * (1 - args.holdout_p)))]
     train_set, valid_set = random_split(full_set, lengths)
 
     # build hold out CV
     # train_set, valid_set = cross_validation(full_set, args.holdout_p)
 
     # choose training device
-    device = torch.device(f'cuda:{args.cuda}' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(
+        f'cuda:{args.cuda}' if torch.cuda.is_available() else 'cpu')
 
     # load model
-    model = Model().model_builder(args.model, args.train_all)
+    model, parameters = Model().model_builder(
+        args.model, num_classes, not args.non_pretrain, args.train_all)
     model = model.to(device)
-
-    # 取得要更新的參數
-    parameters = []
-    for _,param in model.named_parameters():
-        if param.requires_grad == True:
-            parameters.append(param)
 
     # set optimizer
     if args.optim == "Adam":
         optimizer = torch.optim.Adam(parameters, lr=args.lr)
+    elif args.optim == "SGD":
+        optimizer = torch.optim.SGD(
+            parameters, lr=args.lr, momentum=args.momentum)
     else:
-        optimizer = torch.optim.SGD(parameters, lr=args.lr, momentum=args.momentum)
+        optimizer = torch.optim.Adam(parameters, lr=args.lr)
 
     # set scheduler
     if args.scheduler is True:
@@ -59,12 +61,14 @@ def train(args):
         scheduler = None
 
     # set loss function
-    criterion = nn.BCELoss()
+    criterion = nn.MSELoss(reduction='sum').to(device)
+    # criterion = RMSELoss().to(device)
+    # criterion = nn.BCELoss()
 
     # train
-    loss_list = {'train':[], 'valid':[]}
-    accuracy_list = {'train':[], 'valid':[]}
-    dataloader={'train':None, 'valid':None}
+    loss_list = {'train': [], 'valid': []}
+    accuracy_list = {'train': [], 'valid': []}
+    dataloader = {'train': None, 'valid': None}
     best = 100
 
     # set dataloader
@@ -91,7 +95,7 @@ def train(args):
     if not os.path.exists(save_path):
         os.mkdir(save_path)
     args.output_path = save_path
-    print(f"Saving output file and model parameters at {save_path}")
+    print(f"\nSaving output file and model parameters at {save_path}\n")
 
     # start to train
     for epoch in range(args.epochs):
@@ -104,36 +108,36 @@ def train(args):
                 enumerate(dataloader[phase]),
                 total=len(dataloader[phase]),
                 desc=f'{epoch}/{args.epochs}, {phase}'
-            ) as t, torch.set_grad_enabled(phase=='train'):
+            ) as t, torch.set_grad_enabled(phase == 'train'):
                 for _, data in t:
-                    inputs, targets = data[0].to(device), data[1].to(device)
+                    inputs, targets, labels = [d.to(device) for d in data]
 
                     # forward
                     outputs = model(inputs)
                     outputs = nn.functional.softmax(outputs, dim=1)
                     _, preds = torch.max(outputs.data, 1)
-                    targets = targets.to(torch.float32)
-                    outputs = outputs[:, 1]
 
-                    # get threshold values
+                    '''# get threshold values
                     if args.threshold != None:
-                        outputs = threshold_function(outputs, args.threshold, device)
+                        outputs = threshold_function(outputs, args.threshold, device)'''
 
                     # count loss
-                    loss = criterion(outputs, targets)
+                    loss = criterion(outputs.to(torch.float32),
+                                     targets.to(torch.float32))
 
                     # backward
                     if phase == 'train':
-                        optimizer.zero_grad() # 清空上一輪算的 gradient
+                        optimizer.zero_grad()  # 清空上一輪算的 gradient
                         loss.backward()       # 計算 gradient
                         optimizer.step()      # 更新參數
 
                     epoch_loss += loss.item() * inputs.data.size(0)
-                    correct += torch.sum(preds == targets.data)
+                    correct += torch.sum(torch.flatten(preds)
+                                         == torch.flatten(labels))
 
                     # lr scheduler every iteration
                     if args.iteration is True and args.scheduler is True and phase == 'train':
-                            scheduler.step()
+                        scheduler.step()
 
             epoch_loss /= len(dataloader[phase].dataset)
             loss_list[phase].append(epoch_loss)
@@ -146,17 +150,20 @@ def train(args):
 
             if phase == 'valid' and epoch_loss < best:
                 best = epoch_loss
-                torch.save(model.state_dict(), os.path.join(save_path, 'model_weights.pth'))
+                torch.save(model.state_dict(), os.path.join(
+                    save_path, 'model_weights.pth'))
 
-        print(f"Epoch {epoch}\tTrain Loss: {loss_list['train'][-1]:.4f}, Validation Loss: {loss_list['valid'][-1]:.4f}")
-        print(f"Epoch {epoch}\tTrain Accuracy: {accuracy_list['train'][-1]:.4f}, Validation Accuracy: {accuracy_list['valid'][-1]:.4f}\n")
+        print(
+            f"Epoch {epoch+1}\tTrain Loss: {loss_list['train'][-1]:.4f}, Validation Loss: {loss_list['valid'][-1]:.4f}")
+        print(
+            f"Epoch {epoch+1}\tTrain Accuracy: {accuracy_list['train'][-1]:.4f}, Validation Accuracy: {accuracy_list['valid'][-1]:.4f}\n")
 
     # plot the loss curve for training and validation
     pd.DataFrame({
         "train-loss": loss_list['train'],
         "valid-loss": loss_list['valid']
     }).plot()
-    plt.xlabel("Epoch"),plt.ylabel("Loss")
+    plt.xlabel("Epoch"), plt.ylabel("Loss")
     plt.savefig(os.path.join(save_path, "Loss_curve.jpg"))
 
     # plot the accuracy curve for training and validation
@@ -164,14 +171,16 @@ def train(args):
         "train-accuracy": accuracy_list['train'],
         "valid-accuracy": accuracy_list['valid']
     }).plot()
-    plt.xlabel("Epoch"),plt.ylabel("Accuracy")
+    plt.xlabel("Epoch"), plt.ylabel("Accuracy")
     plt.savefig(os.path.join(save_path, "Training_accuracy.jpg"))
 
     print(f"Best Validation Loss: {best}")
+    print(f"\nSaving output files and model parameters at {save_path}")
     print("\nFinished Training\n")
 
 
 if __name__ == '__main__':
 
-    args = argument_setting()
-    train(args)
+    argument_generator = Argument_Generator()
+
+    train(argument_generator)
